@@ -1,0 +1,160 @@
+# Default routing ladder for gemini-decision-router.
+#
+# Copy this file and pass it with `gdr route --tiers my_tiers.toml`,
+# `TierLadder.from_toml("my_tiers.toml")`, or the GEMINI_ROUTER_TIERS env var
+# to route across your own models / thinking levels.
+
+schema_version = 1
+
+[router]
+decision_model = "gemini-decision-1"
+# Tier used when the Decisions API call is safety-blocked or returns no answers.
+fallback_tier = "t2_hydrogen_med"
+# `score_tail`: escalate to the lowest-ranked of these tiers when their combined
+# probability mass >= RouterPolicyConfig.score_frontier_tail_threshold.
+frontier_tiers = ["t3_hydrogen_high", "t4_hydrogen_xhigh"]
+# `score_tail`: route to at least this tier when needs_precision fires.
+precision_floor_tier = "t1_hydrogen_low"
+# Static baseline used by RouterObserver to report compute savings.
+baseline_tier = "t4_hydrogen_xhigh"
+# Optional; needs len(tiers) - 1 strictly increasing values (omitted -> 0.5, 1.5, ...).
+score_cutoffs = [0.75, 1.75, 2.75, 3.75]
+
+# --- Model catalog -----------------------------------------------------------
+# Supported thinking levels verified from
+# https://aistudio.google.com/docs/thinking.md#thinking-levels.
+# Every model must define `compute_weight = { input = ..., output = ... }`, a unitless
+# relative weight per token (1.0 = hydrogen input token); output and thinking tokens
+# carry a higher weight than input tokens.
+
+[models."gemini-decision-1"]
+thinking_levels = []
+compute_weight = { input = 0.067, output = 0.0 }
+
+[models."gemini-3.5-flash-lite"]
+thinking_levels = ["minimal", "low", "medium", "high"]
+compute_weight = { input = 0.2, output = 1.67 }
+
+[models."gemini-3.8-flash"]
+thinking_levels = ["low", "medium", "high"]
+compute_weight = { input = 1.0, output = 5.0 }
+
+[models."gemini-4-argon"]
+thinking_levels = ["low", "medium", "high"]
+compute_weight = { input = 2.67, output = 13.33 }
+
+# Available for custom ladders, but not in the default ladder: on single-turn
+# tasks it did not beat gemini-4-argon (pilot: 23/25 vs 24/25) at ~11x latency.
+[models."gemini-4-carbon"]
+thinking_levels = ["low", "medium", "high"]
+compute_weight = { input = 2.67, output = 13.33 }
+
+# Gemini 4 Hydrogen speed / Flash-tier model supporting xhigh thinking level
+[models."gemini-4-hydrogen"]
+thinking_levels = ["low", "medium", "high", "xhigh"]
+compute_weight = { input = 1.0, output = 5.0 }
+
+# --- Tiers (lightest -> most capable) ----------------------------------------
+# Rules (validated on load):
+# - Rank = position in the list (lightest -> most capable).
+# - Every tier's `model` must exist in `[models]` and support its `thinking_level`.
+# - Each tier needs `expected_output_tokens.default`; per-slice overrides are optional.
+# - `can_solve` / `cannot_solve` become the Decisions API criteria
+#   (score levels, choice options, and noul true/false descriptions).
+
+[[tiers]]
+id = "t0_flash_lite_min"
+model = "gemini-3.5-flash-lite"
+thinking_level = "minimal"
+can_solve = """\
+Single-step factual lookup, surface formatting, simple classification, \
+direct field extraction, or clear spoken/visual headline reading that needs \
+almost no multi-step reasoning."""
+cannot_solve = """\
+Requires writing non-trivial code, multi-step logic or math, cross-referencing \
+dense tables/charts, debugging, or handling subtle edge cases."""
+[tiers.expected_output_tokens]
+# Output + thought token priors (rounded from pilot)
+default = 400
+s1_trivial_text = 100
+s2_everyday_code = 450
+s3_frontier_reasoning = 1300
+s4_visual_and_pdf = 250
+s5_spoken_audio = 50
+
+[[tiers]]
+id = "t1_hydrogen_low"
+model = "gemini-4-hydrogen"
+thinking_level = "low"
+can_solve = """\
+Standard single-function coding, routine data transformation, straightforward \
+chart/document Q&A, or short multi-clause instructions solvable with brief reasoning."""
+cannot_solve = """\
+Requires deep algorithmic design, tricky edge-case verification, multi-page \
+numerical reconciliation, or complex mathematical derivations."""
+[tiers.expected_output_tokens]
+default = 1000
+s1_trivial_text = 400
+s2_everyday_code = 400
+s3_frontier_reasoning = 3600
+s4_visual_and_pdf = 600
+s5_spoken_audio = 250
+
+[[tiers]]
+id = "t2_hydrogen_med"
+model = "gemini-4-hydrogen"
+thinking_level = "medium"
+can_solve = """\
+Moderate multi-step coding with multiple constraints, multi-table synthesis, \
+or structured analytical reasoning solvable by a general-purpose model with \
+moderate thinking budget."""
+cannot_solve = """\
+Requires exhaustive high-deliberation state tracking across dozens of events, \
+frontier mathematical proof, subtle algorithmic or concurrency edge-case verification, \
+combinatorial search, or dense multi-source numerical reconciliation."""
+[tiers.expected_output_tokens]
+default = 6200
+s1_trivial_text = 700
+s2_everyday_code = 2600
+s3_frontier_reasoning = 26000
+s4_visual_and_pdf = 1600
+s5_spoken_audio = 400
+
+[[tiers]]
+id = "t3_hydrogen_high"
+model = "gemini-4-hydrogen"
+thinking_level = "high"
+can_solve = """\
+Complex software engineering, exhaustive multi-event state tracking across long logs, \
+subtle edge-case code verification, multi-step mathematical derivations, and dense \
+multimodal synthesis solvable by high-deliberation test-time compute."""
+cannot_solve = """\
+Requires extreme multi-step search, ultra-deliberative verification with hundred-step \
+mathematical or algorithmic proofs, or exhaustive cross-source numerical reconciliation."""
+[tiers.expected_output_tokens]
+default = 14000
+s1_trivial_text = 900
+s2_everyday_code = 10000
+s3_frontier_reasoning = 50000
+s4_visual_and_pdf = 7000
+s5_spoken_audio = 600
+
+[[tiers]]
+id = "t4_hydrogen_xhigh"
+model = "gemini-4-hydrogen"
+thinking_level = "xhigh"
+can_solve = """\
+Frontier-grade software engineering, exhaustive multi-event state tracking across massive logs, \
+deep multi-step mathematical proofs, subtle concurrency or algorithmic edge cases, \
+and complex multimodal synthesis solvable by maximum deep-deliberation test-time compute."""
+cannot_solve = """\
+Fundamentally unsolvable by any single-turn LLM regardless of thinking budget: \
+requires live external web or tool execution, interactive multi-turn clarification, \
+or is logically self-contradictory."""
+[tiers.expected_output_tokens]
+default = 24000
+s1_trivial_text = 1000
+s2_everyday_code = 16000
+s3_frontier_reasoning = 65000
+s4_visual_and_pdf = 12000
+s5_spoken_audio = 800
