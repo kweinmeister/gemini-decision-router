@@ -1,0 +1,9 @@
+#!include:.gitignore
+.git/
+.github/
+.vscode/
+.idea/
+*.md
+!README.md
+evals/
+tests/
