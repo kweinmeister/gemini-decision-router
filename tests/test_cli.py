@@ -160,3 +160,53 @@ def test_cli_route_with_attachment(
     assert blocks[0]["type"] == "image"
     assert blocks[1]["type"] == "text"
     assert blocks[1]["text"] == "What is in this image?"
+
+
+def test_cli_route_choice_crc_passes_conformal_cdf_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    captured_configs: list[cli.RouterPolicyConfig] = []
+
+    def _mock_route(self: cli.DecisionRouter, _payload: Any) -> RouteDecision:
+        captured_configs.append(self.config)
+        return _make_decision()
+
+    monkeypatch.setattr(cli.DecisionRouter, "route", _mock_route)
+
+    code = cli.main(
+        [
+            "route",
+            "Prove Cauchy's theorem.",
+            "--policy",
+            "choice_crc",
+            "--conformal-cdf-threshold",
+            "0.82",
+        ]
+    )
+
+    assert code == 0
+    capsys.readouterr()
+    assert len(captured_configs) == 1
+    assert captured_configs[0].policy == "choice_crc"
+    assert captured_configs[0].conformal_cdf_threshold == pytest.approx(0.82)
+
+
+@pytest.mark.parametrize("bad_threshold", ["0.0", "-0.5", "1.5", "nan", "not-a-float"])
+def test_cli_route_invalid_conformal_cdf_threshold_exits_with_error(
+    bad_threshold: str,
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "route",
+                "Test prompt",
+                "--policy",
+                "choice_crc",
+                "--conformal-cdf-threshold",
+                bad_threshold,
+            ]
+        )
+
+    assert exc_info.value.code == 2

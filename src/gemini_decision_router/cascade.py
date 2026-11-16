@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from gemini_decision_router.compute import calculate_compute_units
 from gemini_decision_router.envelope import extract_interaction_text, prepare_router_envelope
 from gemini_decision_router.models import RouteDecision, TierID
-from gemini_decision_router.router import DecisionRouter, answers_by_name
+from gemini_decision_router.router import DecisionRouter
 from gemini_decision_router.usage import Usage
 
 __all__ = [
@@ -122,19 +122,13 @@ class HybridCascadeRouter:
         generation_config: dict[str, Any] | None = None,
     ) -> tuple[Any, float, float]:
         spec = self.router.ladder.tier(tier_id)
-        gen_cfg: dict[str, Any] = {"thinking_level": spec.thinking_level}
-        if generation_config:
-            gen_cfg.update(generation_config)
-        kwargs: dict[str, Any] = {
-            "model": spec.model,
-            "input": input_payload,
-            "generation_config": gen_cfg,
-        }
-        if safety_settings is not None:
-            kwargs["safety_settings"] = safety_settings
-        if system_instruction:
-            kwargs["system_instruction"] = system_instruction
-
+        kwargs = self.router.build_execution_kwargs(
+            tier_id,
+            input_payload,
+            system_instruction=system_instruction,
+            safety_settings=safety_settings,
+            generation_config=generation_config,
+        )
         t0 = time.perf_counter()
         interaction = self.router.downstream_client.interactions.create(**kwargs)
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -148,21 +142,11 @@ class HybridCascadeRouter:
         draft_text: str,
     ) -> tuple[float, float, float]:
         ver_input = format_verification_input(input_payload, draft_text)
-        t0 = time.perf_counter()
-        resp = self.router.client.decisions.create(
-            model=self.router.ladder.decision_model,
-            input=cast(Any, ver_input),
-            questions=cast(Any, build_verification_questions()),
+        return self.router.evaluate_noul_probe(
+            ver_input,
+            "draft_solves_request",
+            build_verification_questions(),
         )
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        usage = Usage.from_response(resp)
-        units = calculate_compute_units(
-            self.router.ladder.decision_model, usage, ladder=self.router.ladder
-        )
-        answers = answers_by_name(getattr(resp, "answers", None))
-        ans = answers.get("draft_solves_request")
-        prob = 0.0 if ans is None else float(getattr(ans, "noul", 0.0) or 0.0)
-        return prob, units, latency_ms
 
     def run(
         self,

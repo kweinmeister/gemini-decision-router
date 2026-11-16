@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from google.genai import errors as genai_errors
 
 from gemini_decision_router import (
     CascadeConfig,
@@ -147,3 +148,89 @@ def test_pure_two_stage_cascade_accepts_or_escalates_by_verifier_confidence(
     assert res.verifier_confidence == pytest.approx(verifier_prob)
     assert len(client.interaction_calls) == expected_interactions
     assert len(client.decision_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "recoverable_exc",
+    [
+        RuntimeError("Request rejected with finish_reason=PROHIBITED_CONTENT"),
+        TimeoutError("Verifier request timed out"),
+        ConnectionError("Connection reset by peer"),
+        genai_errors.ServerError(503, {"error": {"message": "Service Unavailable"}}),
+        genai_errors.ClientError(429, {"error": {"message": "Resource Exhausted"}}),
+    ],
+)
+def test_pure_cascade_verifier_recoverable_error_escalates_gracefully(
+    recoverable_exc: Exception,
+) -> None:
+    client = _FakeCascadeClient(prefill_probs={}, verifier_prob=0.95)
+
+    def _raise_recoverable(**kwargs: Any) -> Any:
+        client.decision_calls.append(kwargs)
+        raise recoverable_exc
+
+    client.decisions = SimpleNamespace(create=_raise_recoverable)
+    router = DecisionRouter(
+        config=RouterPolicyConfig(policy="choice_tail"),
+        client=client,
+        downstream_client=client,
+    )
+
+    res = HybridCascadeRouter(
+        router, CascadeConfig(use_prefill_skip=False, accept_threshold=0.70)
+    ).run("Sensitive or rate-limited draft check")
+
+    assert res.escalated is True
+    assert res.final_tier_id == "t1_hydrogen_low"
+    assert res.verifier_confidence == pytest.approx(0.0)
+    assert len(client.interaction_calls) == 2
+
+
+def test_pure_cascade_verifier_in_band_safety_block_escalates_and_tracks_units() -> None:
+    client = _FakeCascadeClient(prefill_probs={}, verifier_prob=0.95)
+    client.decisions = SimpleNamespace(
+        create=lambda **kwargs: SimpleNamespace(
+            answers={},
+            prompt_feedback=SimpleNamespace(block_reason="SAFETY"),
+            usage=SimpleNamespace(total_input_tokens=1_000_000),
+        )
+    )
+    router = DecisionRouter(
+        config=RouterPolicyConfig(policy="choice_tail"),
+        client=client,
+        downstream_client=client,
+    )
+
+    res = HybridCascadeRouter(
+        router, CascadeConfig(use_prefill_skip=False, accept_threshold=0.70)
+    ).run("Blocked verification prompt")
+
+    expected_verifier_units = router.ladder.models[
+        router.ladder.decision_model
+    ].compute_weight.units(1_000_000, 0)
+    assert res.escalated is True
+    assert res.final_tier_id == "t1_hydrogen_low"
+    assert res.verifier_confidence == pytest.approx(0.0)
+    assert res.total_compute_units > expected_verifier_units
+    assert len(client.interaction_calls) == 2
+
+
+def test_pure_cascade_verifier_non_safety_error_propagates() -> None:
+    client = _FakeCascadeClient(prefill_probs={}, verifier_prob=0.95)
+
+    def _raise_auth_error(**_kwargs: Any) -> Any:
+        raise RuntimeError("401 UNAUTHENTICATED: API key not valid")
+
+    client.decisions = SimpleNamespace(create=_raise_auth_error)
+    router = DecisionRouter(
+        config=RouterPolicyConfig(policy="choice_tail"),
+        client=client,
+        downstream_client=client,
+    )
+    cascade = HybridCascadeRouter(
+        router, CascadeConfig(use_prefill_skip=False, accept_threshold=0.70)
+    )
+
+    with pytest.raises(RuntimeError, match="UNAUTHENTICATED"):
+        cascade.run("Lookup prompt")
+    assert len(client.interaction_calls) == 1

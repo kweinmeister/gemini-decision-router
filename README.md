@@ -18,7 +18,7 @@ Tiers, the model catalog, thinking levels, and relative compute weights (`comput
 | `t3_hydrogen_high`  | `gemini-4-hydrogen`     | `high`         |
 | `t4_hydrogen_xhigh` | `gemini-4-hydrogen`     | `xhigh`        |
 
-`gemini-3.8-flash`, `gemini-4-argon`, and `gemini-4-carbon` also have `compute_weight` entries in the catalog for custom ladders; see [Custom tiers](#5-custom-tiers-toml). On load, `TierLadder` checks that every model supports its tier's thinking level, every model defines `compute_weight`, and `score_cutoffs` has one fewer entry than the number of tiers.
+`gemini-3.8-flash`, `gemini-4-argon`, and `gemini-4-carbon` also have `compute_weight` entries in the catalog for custom ladders; see [Custom tiers](#7-custom-tiers-toml). On load, `TierLadder` checks that every model supports its tier's thinking level, every model defines `compute_weight`, and `score_cutoffs` has one fewer entry than the number of tiers.
 
 ### Router-pass media compression
 
@@ -26,13 +26,14 @@ For the routing pass, `envelope.py` clones image and video blocks at low resolut
 
 ### Calibrated routing policies
 
-`router.py` supports three Decisions API primitives (`score`, `choice`, `noul`) exposed as five `RouterPolicyConfig.policy` modes:
+`router.py` supports three Decisions API primitives (`score`, `choice`, `noul`) exposed as six `RouterPolicyConfig.policy` modes:
 
 | Policy                   | How it selects a tier                                                                                                                                                                                      | Key knobs (`RouterPolicyConfig` / TOML)                                                         | Best for                                                                             |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `score_tail` _(default)_ | Bins the expected rubric `score` via `score_cutoffs`, escalates to the lowest-ranked `frontier_tiers` if their combined tail mass is high, and applies `precision_floor_tier` when `needs_precision` fires | `score_cutoffs`, `score_frontier_tail_threshold` (`0.35`), `needs_precision_threshold` (`0.65`) | Production default — guards against under-routing hard/ambiguous prompts (tail risk) |
 | `choice_tail`            | Picks the lowest-ranked tier whose cumulative `choice` probability reaches the target threshold (or bins the expected rank if `score_cutoffs` is set)                                                      | `choice_cdf_threshold` (`0.70`), optional `score_cutoffs`                                       | Simpler single-question tail-risk control without a separate `needs_precision` probe |
-| `noul_eu`                | Runs parallel `noul` (yes/no) solvability probes per tier, projects them onto a monotone non-decreasing curve via PAVA (`pava_isotonic_increasing`), and maximizes $\hat{p}_{i,t} - \lambda \hat{u}_{i,t}$ | `eu_lambda` (`6.0`), `expected_output_tokens`                                                   | Input-length-aware cost/compute vs. accuracy trade-offs (e.g., very long prompts)    |
+| `choice_crc`             | Uses a 1D Conformal Risk Control cumulative `choice` threshold calibrated against an accuracy-regret budget $\alpha$ via `calibrate_conformal_cdf_threshold`                                               | `conformal_cdf_threshold` (falls back to `[router].conformal_cdf_threshold` or `choice_cdf_threshold`) | Finite-sample accuracy-drop guarantees once you have graded eval examples            |
+| `noul_eu`                | Runs parallel `noul` (yes/no) solvability probes per tier, optionally calibrates via `fit_per_tier_platt_scaling`, projects via PAVA (`pava_isotonic_increasing`), and maximizes $\hat{p}_{i,t} - \lambda \hat{u}_{i,t}$ | `eu_lambda` (`6.0`), `noul_platt_params`, `expected_output_tokens_table`                        | Input-length-aware cost/compute vs. accuracy trade-offs (e.g., very long prompts)    |
 | `score_argmax`           | Picks the single highest-probability tier from the `score` distribution (ignores tail mass and `needs_precision`)                                                                                          | —                                                                                               | Baselines or ablations                                                               |
 | `choice_argmax`          | Picks the single highest-probability tier from the `choice` distribution                                                                                                                                   | —                                                                                               | Baselines or ablations                                                               |
 
@@ -79,7 +80,7 @@ observer = RouterObserver(baseline_tier_id="t4_hydrogen_xhigh")
 
 router = DecisionRouter(
     config=RouterPolicyConfig(
-        policy="score_tail",  # "score_tail" | "choice_tail" | "noul_eu" | "score_argmax" | "choice_argmax"
+        policy="score_tail",  # "score_tail" | "choice_tail" | "choice_crc" | "noul_eu" | "score_argmax" | "choice_argmax"
         compress_media_for_router=True,
     ),
     observer=observer,
@@ -174,11 +175,45 @@ result = cascade.run("Summarize this incident timeline and identify the root cau
 print(result.final_tier_id, result.prefill_skipped_cheap, result.escalated)
 ```
 
-### 5. Command-line interface (`gdr`)
+### 5. Conformal Risk Control (`choice_crc`) and Platt calibration
+
+```python
+from gemini_decision_router import (
+    DecisionRouter,
+    RouterPolicyConfig,
+    calibrate_conformal_cdf_threshold,
+    default_ladder,
+    fit_per_tier_platt_scaling,
+)
+
+ladder = default_ladder()
+
+# Fit a finite-sample Conformal Risk Control threshold guaranteeing E[regret] <= target_alpha
+crc = calibrate_conformal_cdf_threshold(
+    choice_probs_list,
+    tier_accuracies_list,
+    ladder.ordered_tier_ids,
+    target_alpha=0.015,
+)
+crc_router = DecisionRouter(
+    config=RouterPolicyConfig(policy="choice_crc", conformal_cdf_threshold=crc.threshold)
+)
+
+# Optional: fit per-tier Platt scaling on labeled noul solvability pairs before PAVA in noul_eu
+platt = fit_per_tier_platt_scaling(noul_pairs_by_tier)
+eu_router = DecisionRouter(config=RouterPolicyConfig(policy="noul_eu", noul_platt_params=platt))
+```
+
+### 6. Command-line interface (`gdr`)
 
 ```bash
 # Inspect routing decision as JSON
 uv run gdr route "Write a Python function to merge overlapping intervals." --policy score_tail
+
+# Route with a calibrated Conformal Risk Control threshold
+uv run gdr route "Prove Cauchy's theorem for finite groups." \
+  --policy choice_crc \
+  --conformal-cdf-threshold 0.82
 
 # Route a multimodal prompt with an image/PDF/audio attachment and execute downstream
 uv run gdr route "Summarize the key anomalies in this chart." \
@@ -189,7 +224,7 @@ uv run gdr route "Summarize the key anomalies in this chart." \
 uv run gdr tiers --tiers my_tiers.toml
 ```
 
-### 5. Custom tiers (TOML)
+### 7. Custom tiers (TOML)
 
 Copy [`default_tiers.toml`](src/gemini_decision_router/default_tiers.toml), edit the `[models]` catalog and `[[tiers]]` list from cheapest to most capable, then load it via the SDK, CLI, or `GEMINI_ROUTER_TIERS`:
 

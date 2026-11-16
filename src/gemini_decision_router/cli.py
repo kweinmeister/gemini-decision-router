@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, get_args
@@ -12,6 +13,16 @@ from typing import Any, get_args
 from gemini_decision_router.envelope import extract_interaction_text, load_media_block
 from gemini_decision_router.ladder import LADDER_ENV_VAR, resolve_ladder
 from gemini_decision_router.router import DecisionRouter, PolicyMode, RouterPolicyConfig
+
+
+def _conformal_threshold_arg(raw: str) -> float:
+    try:
+        val = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected float in (0, 1], got {raw!r}") from exc
+    if not (0.0 < val <= 1.0 and math.isfinite(val)):
+        raise argparse.ArgumentTypeError(f"must be in (0, 1], got {raw!r}")
+    return val
 
 
 def add_tiers_argument(parser: argparse.ArgumentParser) -> None:
@@ -57,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Routing decision policy (default: score_tail).",
     )
     route_p.add_argument(
+        "--conformal-cdf-threshold",
+        type=_conformal_threshold_arg,
+        default=None,
+        help="Optional calibrated CDF threshold in (0, 1] for --policy choice_crc.",
+    )
+    route_p.add_argument(
         "--no-compress",
         action="store_true",
         help="Disable low-res image and page-1 PDF compression on the router pass.",
@@ -92,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = RouterPolicyConfig(
             policy=args.policy,
             compress_media_for_router=not args.no_compress,
+            conformal_cdf_threshold=args.conformal_cdf_threshold,
             ladder=ladder,
         )
         router = DecisionRouter(config=cfg)

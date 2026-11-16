@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from gemini_decision_router.observability import RouterObserver
 from gemini_decision_router.router import DecisionRouter, PolicyMode, RouterPolicyConfig
-from gemini_decision_router.server import create_app
+from gemini_decision_router.server import RouteRequest, ServerLimits, create_app
 
 
 def _fake_client(
@@ -159,8 +161,6 @@ def test_server_emits_structured_json_log_with_trace_and_redacts_prompt(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import json
-
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-log-proj")
     secret_prompt = "SECRET_USER_PII_DO_NOT_LOG"
     valid_trace_id = "0123456789abcdef0123456789abcdef"
@@ -187,14 +187,13 @@ def test_server_emits_structured_json_log_with_trace_and_redacts_prompt(
     assert secret_prompt not in captured[0]
 
 
-def test_server_omits_malformed_trace_and_enforces_limits_and_bad_b64(
+def test_server_omits_malformed_trace_header_from_structured_log(
     make_test_client: Callable[..., TestClient],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import json
-
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-log-proj")
+
     with make_test_client() as client:
         capsys.readouterr()
         resp = client.post(
@@ -202,60 +201,70 @@ def test_server_omits_malformed_trace_and_enforces_limits_and_bad_b64(
             json={"input": "hello"},
             headers={"X-Cloud-Trace-Context": "not-32-hex/12345;o=1"},
         )
-        assert resp.status_code == 200
-        entry = json.loads(capsys.readouterr().out.strip())
-        assert "logging.googleapis.com/trace" not in entry
 
-        # Malformed base64 PDF returns 422 rather than 500
-        bad_pdf_resp = client.post(
+    assert resp.status_code == 200
+    entry = json.loads(capsys.readouterr().out.strip())
+    assert "logging.googleapis.com/trace" not in entry
+
+
+def test_server_route_malformed_base64_pdf_returns_422(
+    make_test_client: Callable[..., TestClient],
+) -> None:
+    with make_test_client() as client:
+        resp = client.post(
             "/v1/route",
             json={
                 "input": [{"type": "document", "mime_type": "application/pdf", "data": "!!bad!!"}]
             },
         )
-        assert bad_pdf_resp.status_code == 422
 
-    # Configurable GEMINI_ROUTER_MAX_* limits reject oversized inputs with 422
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        ("/v1/route", {"input": "x" * 11}),
+        ("/v1/route", {"input": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}),
+        ("/v1/route", {"input": [{"type": "image", "mime_type": "image/png", "data": "A" * 9}]}),
+        ("/v1/route-and-execute", {"input": "ok", "system_instruction": "too long"}),
+    ],
+)
+def test_server_enforces_configured_payload_limits_with_422(
+    make_test_client: Callable[..., TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    payload: dict[str, Any],
+) -> None:
     monkeypatch.setenv("GEMINI_ROUTER_MAX_TEXT_CHARS", "10")
     monkeypatch.setenv("GEMINI_ROUTER_MAX_MEDIA_B64_CHARS", "8")
     monkeypatch.setenv("GEMINI_ROUTER_MAX_BLOCKS", "1")
     monkeypatch.setenv("GEMINI_ROUTER_MAX_SYSTEM_INSTRUCTION_CHARS", "5")
+
     with make_test_client() as client:
-        assert client.post("/v1/route", json={"input": "x" * 11}).status_code == 422
-        assert (
-            client.post(
-                "/v1/route",
-                json={"input": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
-            ).status_code
-            == 422
-        )
-        assert (
-            client.post(
-                "/v1/route",
-                json={"input": [{"type": "image", "mime_type": "image/png", "data": "A" * 9}]},
-            ).status_code
-            == 422
-        )
-        assert (
-            client.post(
-                "/v1/route-and-execute",
-                json={"input": "ok", "system_instruction": "too long"},
-            ).status_code
-            == 422
-        )
+        resp = client.post(endpoint, json=payload)
 
-    from gemini_decision_router.server import RouteRequest, ServerLimits
+    assert resp.status_code == 422
 
+
+def test_server_limits_non_positive_field_raises_value_error() -> None:
     with pytest.raises(ValueError, match="must be > 0"):
         ServerLimits(max_blocks=0)
 
-    from pydantic import ValidationError
 
+@pytest.mark.parametrize(
+    "invalid_kwargs",
+    [
+        {"input": "   "},
+        {"input": [{"type": "text", "text": "  \t "}]},
+        {"input": "ok", "policy": "choice_crc", "conformal_cdf_threshold": 1.5},
+    ],
+)
+def test_route_request_schema_rejects_invalid_inputs(invalid_kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
-        RouteRequest(input="   ")
-    with pytest.raises(ValidationError):
-        RouteRequest(input=[{"type": "text", "text": "  \t "}])
-    with pytest.raises(ValidationError):
-        RouteRequest(input="ok", policy="choice_crc", conformal_cdf_threshold=1.5)
+        RouteRequest(**invalid_kwargs)
+
+
+def test_route_request_schema_accepts_valid_conformal_threshold() -> None:
     req = RouteRequest(input="ok", policy="choice_crc", conformal_cdf_threshold=0.85)
     assert req.conformal_cdf_threshold == 0.85

@@ -48,19 +48,21 @@ def test_build_sandbox_command_colima_docker() -> None:
 
 def test_detect_available_backend_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     detect_available_backend.cache_clear()
-    monkeypatch.setattr(sandbox.os.path, "exists", lambda p: True)
-    monkeypatch.setattr(
-        sandbox.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], returncode=0, stdout="", stderr=""
-        ),
-    )
-    b1 = detect_available_backend("container")
-    b2 = detect_available_backend("container")
-    assert b1 == b2 == "container"
-    assert detect_available_backend.cache_info().hits >= 1
-    detect_available_backend.cache_clear()
+    try:
+        monkeypatch.setattr(sandbox.os.path, "exists", lambda p: True)
+        monkeypatch.setattr(
+            sandbox.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0], returncode=0, stdout="", stderr=""
+            ),
+        )
+        b1 = detect_available_backend("container")
+        b2 = detect_available_backend("container")
+        assert b1 == b2 == "container"
+        assert detect_available_backend.cache_info().hits >= 1
+    finally:
+        detect_available_backend.cache_clear()
 
 
 def test_scrubbed_host_env_excludes_api_keys(monkeypatch: pytest.MonkeyPatch) -> None:

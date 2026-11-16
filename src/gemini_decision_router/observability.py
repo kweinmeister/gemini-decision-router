@@ -27,6 +27,8 @@ def compute_calibration_metrics(
         predictions: List of `(predicted_probability, empirical_outcome)` pairs in `[0, 1]`.
         num_bins: Number of equal-width probability bins in `[0, 1]` (default: 10).
     """
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be positive, got {num_bins}")
     if not predictions:
         return {"brier_score": 0.0, "log_loss": 0.0, "ece": 0.0, "count": 0.0, "bins": []}
 
@@ -121,7 +123,7 @@ def spearman_rank_correlation(xs: list[float], ys: list[float]) -> float:
     den_y = math.sqrt(sum((b - my) ** 2 for b in ry))
     if den_x < 1e-12 or den_y < 1e-12:
         return 0.0
-    return num / (den_x * den_y)
+    return min(1.0, max(-1.0, num / (den_x * den_y)))
 
 
 @dataclass

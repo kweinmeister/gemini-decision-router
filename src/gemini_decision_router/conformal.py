@@ -7,6 +7,7 @@ tier distributions, with optional importance weights for traffic-mix shifts.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -73,6 +74,10 @@ def calibrate_conformal_cdf_threshold(
         raise ValueError("ordered_tier_ids must not be empty")
     if not 0.0 < target_alpha <= 1.0:
         raise ValueError(f"target_alpha must be in (0, 1], got {target_alpha}")
+    if grid_size <= 0:
+        raise ValueError(f"grid_size must be positive, got {grid_size}")
+    if not (upper_bound_b > 0.0 and math.isfinite(upper_bound_b)):
+        raise ValueError(f"upper_bound_b must be finite and positive, got {upper_bound_b}")
 
     if weights is None:
         norm_weights = [1.0] * n
@@ -80,8 +85,8 @@ def calibrate_conformal_cdf_threshold(
     else:
         if len(weights) != n:
             raise ValueError(f"weights length ({len(weights)}) must match items ({n})")
-        if any(float(w) < 0.0 for w in weights):
-            raise ValueError("weights must be non-negative")
+        if any(not math.isfinite(float(w)) or float(w) < 0.0 for w in weights):
+            raise ValueError("weights must be finite and non-negative")
         w_sum = sum(float(w) for w in weights)
         if w_sum <= 0.0:
             raise ValueError("weights must have positive sum")

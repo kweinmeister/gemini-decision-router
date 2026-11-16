@@ -5,11 +5,14 @@ from __future__ import annotations
 import base64
 import io
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
+import gemini_decision_router.envelope as envelope_mod
 from gemini_decision_router.envelope import (
     ImageResolution,
     _read_and_encode_file,
@@ -19,6 +22,8 @@ from gemini_decision_router.envelope import (
     extract_modality_tokens,
     load_media_block,
     payload_has_compressible_media,
+    prepare_router_envelope,
+    render_pdf_first_page_png_bytes,
     resolve_safe_attachment_path,
     slice_pdf_first_page_bytes,
 )
@@ -257,8 +262,6 @@ def test_estimate_input_tokens_across_modalities_and_corrupt_pdf() -> None:
 
 
 def test_extract_interaction_text_and_modality_tokens() -> None:
-    from types import SimpleNamespace
-
     # 1. Direct output_text takes precedence
     assert extract_interaction_text(SimpleNamespace(output_text="  hello  ")) == "hello"
 
@@ -291,8 +294,6 @@ def test_extract_interaction_text_and_modality_tokens() -> None:
 
 
 def test_prepare_router_envelope_uncompressed_list_passthrough() -> None:
-    from gemini_decision_router.envelope import prepare_router_envelope
-
     text_blocks = [{"type": "text", "text": "hello world"}]
     out, est_tokens, is_uncompressed = prepare_router_envelope(text_blocks)
     assert out is text_blocks
@@ -306,69 +307,85 @@ def test_prepare_router_envelope_uncompressed_list_passthrough() -> None:
     assert is_uncompressed2 is True
 
 
-def test_envelope_security_guards_and_pdf_pixel_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from gemini_decision_router.envelope import (
-        _read_and_encode_file,
-        compress_blocks_for_router,
-        estimate_input_tokens,
-        render_pdf_first_page_png_bytes,
-    )
-
-    # 1. None text in block does not raise TypeError
+def test_estimate_input_tokens_handles_none_fields_safely() -> None:
     assert estimate_input_tokens([{"type": "text", "text": None}]) == 1
+    assert estimate_input_tokens([{"type": "audio", "data": None}]) == 128
 
-    # 2. Malformed base64 or corrupt PDF raises ValueError (not binascii.Error / RuntimeError)
-    with pytest.raises(ValueError, match="Invalid base64"):
+
+@pytest.mark.parametrize(
+    ("data", "expected_match"),
+    [
+        ("not!valid!b64", "Invalid base64"),
+        (None, "Invalid base64"),
+        (base64.b64encode(b"not-a-pdf").decode("ascii"), "Invalid PDF"),
+    ],
+)
+def test_compress_blocks_for_router_invalid_pdf_payload_raises_value_error(
+    data: Any,
+    expected_match: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_match):
         compress_blocks_for_router(
-            [{"type": "document", "mime_type": "application/pdf", "data": "not!valid!b64"}],
+            [{"type": "document", "mime_type": "application/pdf", "data": data}],
             pdf_mode="page1_pdf",
         )
-    with pytest.raises(ValueError, match="Invalid PDF"):
-        compress_blocks_for_router(
-            [
-                {
-                    "type": "document",
-                    "mime_type": "application/pdf",
-                    "data": base64.b64encode(b"not-a-pdf").decode("ascii"),
-                }
-            ],
-            pdf_mode="page1_pdf",
-        )
 
-    # 3. Huge PDF page dimensions are capped to max_pixels on the longest edge
+
+def test_render_pdf_first_page_png_bytes_caps_longest_edge_to_max_pixels() -> None:
     writer = PdfWriter()
     writer.add_blank_page(width=20_000, height=10_000)
     huge_buf = io.BytesIO()
     writer.write(huge_buf)
+
     png_bytes, total_pages = render_pdf_first_page_png_bytes(huge_buf.getvalue(), max_pixels=512)
+
     assert total_pages == 1
     with Image.open(io.BytesIO(png_bytes)) as img:
         assert max(img.size) <= 512
 
-    # 4. Attachment file size limit is enforced
+
+def test_read_and_encode_file_oversized_attachment_raises_value_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     big_file = tmp_path / "huge.png"
     big_file.write_bytes(b"0" * 100)
-    _read_and_encode_file.cache_clear()
     monkeypatch.setenv("GEMINI_ROUTER_MAX_ATTACHMENT_BYTES", "50")
-    with pytest.raises(ValueError, match="exceeds limit"):
-        _read_and_encode_file(str(big_file.resolve()))
     _read_and_encode_file.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="exceeds limit"):
+            _read_and_encode_file(str(big_file.resolve()))
+    finally:
+        _read_and_encode_file.cache_clear()
 
-    # 5. None audio data does not raise TypeError
-    assert estimate_input_tokens([{"type": "audio", "data": None}]) == 128
 
-    # 6. Non-string base64 payload (e.g. None) raises ValueError, not TypeError
-    with pytest.raises(ValueError, match="Invalid base64"):
-        compress_blocks_for_router(
-            [{"type": "document", "mime_type": "application/pdf", "data": None}],
-            pdf_mode="page1_pdf",
-        )
-
-    # 7. .mov / video/quicktime is accepted by load_media_block
+def test_load_media_block_quicktime_mov_returns_video_block(tmp_path: Path) -> None:
     mov_file = tmp_path / "clip.mov"
     mov_file.write_bytes(b"fake-mov")
+
     mov_block = load_media_block(mov_file, allowed_root=tmp_path)
+
     assert mov_block["type"] == "video"
     assert mov_block["mime_type"] == "video/quicktime"
+
+
+@pytest.mark.parametrize(
+    "internal_exc",
+    [
+        IndexError("broken page tree"),
+        KeyError("/Pages"),
+    ],
+)
+def test_slice_pdf_first_page_bytes_malformed_xref_raises_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+    internal_exc: Exception,
+) -> None:
+    def _broken_reader(*_args: object, **_kwargs: object) -> object:
+        raise internal_exc
+
+    monkeypatch.setattr(envelope_mod, "PdfReader", _broken_reader)
+
+    with pytest.raises(ValueError, match="Invalid PDF document payload") as exc_info:
+        slice_pdf_first_page_bytes(b"%PDF-1.4 broken")
+
+    assert exc_info.value.__cause__ is internal_exc

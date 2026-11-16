@@ -164,7 +164,7 @@ def slice_pdf_first_page_bytes(pdf_bytes: bytes) -> tuple[bytes, int]:
         buf = io.BytesIO()
         writer.write(buf)
         return buf.getvalue(), total_pages
-    except (PdfReadError, PdfStreamError, ValueError, RuntimeError) as exc:
+    except (PdfReadError, PdfStreamError, ValueError, RuntimeError, IndexError, KeyError) as exc:
         raise ValueError("Invalid PDF document payload.") from exc
 
 

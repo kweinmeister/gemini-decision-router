@@ -804,3 +804,20 @@ def test_vertexai_env_var_and_hybrid_downstream_client(
     hybrid_router = DecisionRouter()
     assert hybrid_router.client is not None
     assert hybrid_router.downstream_client is not hybrid_router.client
+
+
+@pytest.mark.parametrize("policy", ["score_argmax", "score_tail"])
+def test_select_tier_from_score_distribution_accepts_integer_rank_keys(
+    policy: PolicyMode,
+) -> None:
+    from gemini_decision_router.router import select_tier_from_score_distribution
+
+    cfg = RouterPolicyConfig(policy=policy)
+    str_probs = {"0": 0.45, "1": 0.15, "2": 0.00, "3": 0.25, "4": 0.15}
+    int_probs = {0: 0.45, 1: 0.15, 2: 0.00, 3: 0.25, 4: 0.15}
+
+    str_tier, str_conf = select_tier_from_score_distribution(1.2, str_probs, 0.1, cfg)
+    int_tier, int_conf = select_tier_from_score_distribution(1.2, int_probs, 0.1, cfg)
+
+    assert int_tier == str_tier
+    assert int_conf == pytest.approx(str_conf)

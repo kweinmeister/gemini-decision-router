@@ -1,7 +1,5 @@
 """Stage 3: 5-fold stratified CV, Leave-One-Replicate-Out (LORO) Oracle, ECE/Brier/LogLoss, Q4 fidelity, and paired bootstrap."""
 
-from __future__ import annotations
-
 import argparse
 import bisect
 import collections

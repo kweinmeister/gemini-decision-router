@@ -229,11 +229,7 @@ def _router_for_request(
     target_crc = (
         req.conformal_cdf_threshold
         if req.conformal_cdf_threshold is not None
-        else (
-            ladder.conformal_cdf_threshold
-            if ladder.conformal_cdf_threshold is not None
-            else base_router.config.conformal_cdf_threshold
-        )
+        else base_router.config.conformal_cdf_threshold
     )
     if (
         req.policy == base_router.config.policy

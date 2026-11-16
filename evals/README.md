@@ -85,11 +85,20 @@ uv run python -m evals.collect_matrix \
   --concurrency 2 \
   --sandbox-backend container
 
+# Optional Stage 2b: Score cheap-tier drafts with gemini-decision-1 for pure & hybrid cascade arms
+uv run python -m evals.routers \
+  --dataset data/eval.jsonl \
+  --cascade-matrix results/downstream_matrix.jsonl \
+  --cascade-output results/cascade_verifiers.jsonl \
+  --cheap-tier t0_flash_lite_min \
+  --concurrency 2
+
 # Stage 3: Run 5-fold stratified CV, LORO Oracle, ECE/Brier/LogLoss, Q4 fidelity, and 10k paired bootstrap
 uv run python -m evals.analyze \
   --dataset data/eval.jsonl \
   --matrix results/downstream_matrix.jsonl \
   --routers results/router_telemetry.jsonl \
+  --cascade-verifiers results/cascade_verifiers.jsonl \
   --output results/summary.json
 
 # Render Pareto, Latency Break-Even, and Calibration Reliability plots

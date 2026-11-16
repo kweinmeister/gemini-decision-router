@@ -6,7 +6,7 @@ import bisect
 import dataclasses
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -117,6 +117,14 @@ class RouterPolicyConfig:
                 f"score_cutoffs needs {len(lad) - 1} values for a {len(lad)}-tier ladder, got {len(cutoffs)}"
             )
         return cutoffs
+
+    @property
+    def resolved_conformal_cdf_threshold(self) -> float:
+        if self.conformal_cdf_threshold is not None:
+            return self.conformal_cdf_threshold
+        if self.resolved_ladder.conformal_cdf_threshold is not None:
+            return self.resolved_ladder.conformal_cdf_threshold
+        return self.choice_cdf_threshold
 
     def estimate_compute_units(self, tier_id: TierID, known_input_tokens: int) -> float:
         """Length-aware expected compute units for running `tier_id` under this config."""
@@ -248,7 +256,7 @@ def _select_by_cutoffs_and_frontier_tail(
 
 def select_tier_from_score_distribution(
     score_val: float,
-    probabilities: dict[str, float],
+    probabilities: Mapping[str, float] | Mapping[int, float] | Mapping[str | int, float],
     needs_precision_noul: float | None,
     config: RouterPolicyConfig,
 ) -> tuple[TierID, float]:
@@ -260,7 +268,11 @@ def select_tier_from_score_distribution(
     lad = config.resolved_ladder
     ordered_ids = config.resolved_tier_order
     pos_of = {tid: pos for pos, tid in enumerate(ordered_ids)}
-    probs_by_idx = [float(probabilities.get(str(lad.index(tid)), 0.0)) for tid in ordered_ids]
+    prob_lookup = cast(Mapping[Any, float], probabilities)
+    probs_by_idx = [
+        float(prob_lookup.get(str(rank), prob_lookup.get(rank, 0.0)))
+        for rank in (lad.index(tid) for tid in ordered_ids)
+    ]
 
     if config.policy == "score_argmax":
         best_idx = max(range(len(probs_by_idx)), key=lambda i: probs_by_idx[i])
@@ -306,16 +318,9 @@ def select_tier_from_choice_distribution(
         return ordered_ids[best_idx], selected_tier_confidence(ordered_probs, best_idx)
 
     if config.policy == "choice_crc":
-        threshold = (
-            config.conformal_cdf_threshold
-            if config.conformal_cdf_threshold is not None
-            else (
-                config.resolved_ladder.conformal_cdf_threshold
-                if config.resolved_ladder.conformal_cdf_threshold is not None
-                else config.choice_cdf_threshold
-            )
+        return select_tier_from_cdf_threshold(
+            probabilities, ordered_ids, config.resolved_conformal_cdf_threshold
         )
-        return select_tier_from_cdf_threshold(probabilities, ordered_ids, threshold)
 
     # When `score_cutoffs` is explicitly provided (e.g. out-of-fold CV tuning), apply the exact
     # same multi-cutoff + frontier-tail cost-sensitive selector used by `score_tail`.
@@ -468,6 +473,9 @@ POLICY_FAMILIES: dict[PolicyMode, PolicyFamily] = {
 }
 
 
+_TRANSIENT_API_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+
 def _is_safety_api_error(exc: Exception) -> tuple[bool, str]:
     """Detect whether an exception from `client.decisions.create` is a safety/content block."""
     msg = str(exc).lower()
@@ -481,6 +489,18 @@ def _is_safety_api_error(exc: Exception) -> tuple[bool, str]:
     ):
         return True, "http_400_safety"
     return False, ""
+
+
+def _is_recoverable_verifier_error(exc: Exception) -> bool:
+    """Return True for content-safety blocks or transient API/network verifier errors."""
+    if _is_safety_api_error(exc)[0]:
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError, genai_errors.ServerError)):
+        return True
+    return (
+        isinstance(exc, genai_errors.APIError)
+        and getattr(exc, "code", None) in _TRANSIENT_API_STATUS_CODES
+    )
 
 
 def _env_truthy(name: str) -> bool:
@@ -791,20 +811,29 @@ class DecisionRouter:
             return self._fail_route(exc, t0, est_in_tokens)
         return self._complete_route(resp, t0, est_in_tokens, is_uncompressed)
 
-    def _build_execution_kwargs(
+    def build_execution_kwargs(
         self,
-        decision: RouteDecision,
+        target: RouteDecision | TierID,
         input_payload: str | list[dict[str, Any]],
         *,
         system_instruction: str | None = None,
         safety_settings: list[dict[str, str]] | None = None,
         generation_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        gen_config: dict[str, Any] = {"thinking_level": decision.thinking_level}
+        """Build `interactions.create` keyword arguments for a `RouteDecision` or `TierID`."""
+        if isinstance(target, RouteDecision):
+            model = target.model
+            thinking_level = target.thinking_level
+        else:
+            spec = self.ladder.tier(target)
+            model = spec.model
+            thinking_level = spec.thinking_level
+
+        gen_config: dict[str, Any] = {"thinking_level": thinking_level}
         if generation_config:
             gen_config.update(generation_config)
         kwargs: dict[str, Any] = {
-            "model": decision.model,
+            "model": model,
             "input": input_payload,
             "generation_config": gen_config,
         }
@@ -813,6 +842,39 @@ class DecisionRouter:
         if system_instruction:
             kwargs["system_instruction"] = system_instruction
         return kwargs
+
+    def evaluate_noul_probe(
+        self,
+        probe_input: str | list[dict[str, Any]],
+        question_name: str,
+        questions: dict[str, dict[str, Any]],
+    ) -> tuple[float, float, float]:
+        """Evaluate a `noul` probe on `decision_model`, returning `(prob, compute_units, latency_ms)`.
+
+        Safety blocks and transient API/network failures return `prob = 0.0` so callers (such as
+        cascade verifiers) can fail closed / escalate gracefully without masking auth bugs.
+        """
+        t0 = time.perf_counter()
+        try:
+            resp = self.client.decisions.create(
+                model=self.ladder.decision_model,
+                input=cast(Any, probe_input),
+                questions=cast(Any, questions),
+            )
+        except Exception as exc:
+            if not _is_recoverable_verifier_error(exc):
+                raise
+            return 0.0, 0.0, (time.perf_counter() - t0) * 1000.0
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        usage = Usage.from_response(resp)
+        units = calculate_compute_units(self.ladder.decision_model, usage, ladder=self.ladder)
+        prompt_fb = getattr(resp, "prompt_feedback", None)
+        if prompt_fb and getattr(prompt_fb, "block_reason", None):
+            return 0.0, units, latency_ms
+        answers = answers_by_name(getattr(resp, "answers", None))
+        ans = answers.get(question_name)
+        prob = 0.0 if ans is None else float(getattr(ans, "noul", 0.0) or 0.0)
+        return prob, units, latency_ms
 
     def route_and_execute(
         self,
@@ -827,7 +889,7 @@ class DecisionRouter:
         decision = self.route(input_payload)
         if on_decision is not None:
             on_decision(decision)
-        kwargs = self._build_execution_kwargs(
+        kwargs = self.build_execution_kwargs(
             decision,
             input_payload,
             system_instruction=system_instruction,
@@ -850,7 +912,7 @@ class DecisionRouter:
         decision = await self.aroute(input_payload)
         if on_decision is not None:
             on_decision(decision)
-        kwargs = self._build_execution_kwargs(
+        kwargs = self.build_execution_kwargs(
             decision,
             input_payload,
             system_instruction=system_instruction,
