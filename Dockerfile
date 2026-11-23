@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.14-slim AS builder
+FROM python:3.15-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /uvx /bin/
 
@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --extra server --no-editable
 
 
-FROM python:3.14-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/kweinmeister/gemini-decision-router"
 
